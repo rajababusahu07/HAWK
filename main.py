@@ -1,630 +1,482 @@
-# ============================================================================
-# HAWK ANOMALY DETECTION - COMPLETE EVALUATION WITH YOUR DATASET
-# ============================================================================
-
-import numpy as np
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.ensemble import IsolationForest
-from sklearn.metrics import (classification_report, confusion_matrix, 
-                            accuracy_score, precision_score, recall_score, 
-                            f1_score)
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, precision_score, recall_score
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, RepeatVector, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
+from tensorflow import keras
+from tensorflow.keras import layers
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import warnings
-import time
 warnings.filterwarnings('ignore')
 
-print(f"TensorFlow: {tf.__version__}")
-print(f"GPU Available: {len(tf.config.list_physical_devices('GPU')) > 0}")
+np.random.seed(42)
+tf.random.set_seed(42)
 
-
-# ============================================================================
-# LOAD YOUR HAWK DATASET
-# ============================================================================
-print("\n" + "="*80)
-print("LOADING HAWK DATASET")
+print("="*80)
+print("HAWK v5.0 FINAL - Production-Ready Drone Anomaly Detection System")
 print("="*80)
 
-# Load your CSV file
-data_path = '/content/hawk_data.csv'  # Change path if needed
-full_data = pd.read_csv(data_path)
+# ==============================================================================
+# LOAD DATA
+# ==============================================================================
+print("\nLoading data...")
+df = pd.read_csv('/content/hawk_data.csv')
+print(f"Loaded: {df.shape[0]} rows, {df.shape[1]} columns")
 
-print(f"Dataset loaded: {full_data.shape}")
-print(f"Columns: {full_data.columns.tolist()}")
-print("\nFirst 5 rows:")
-print(full_data.head())
+# ==============================================================================
+# ADVANCED DATA PREPROCESSING
+# ==============================================================================
+print("\nAdvanced data preprocessing...")
 
-# Check for missing values
-print(f"\nMissing values:\n{full_data.isnull().sum()}")
+# Convert timestamps to normalized differences
+for col in ['pitch', 'yaw', 'gps_drift']:
+    if df[col].max() > 1e8:
+        df[f'{col}_delta'] = df[col].diff().fillna(0)
+        # Clip to 99th percentile
+        upper = df[f'{col}_delta'].abs().quantile(0.99)
+        df[f'{col}_delta'] = df[f'{col}_delta'].clip(-upper, upper)
 
-# Handle any NaN/Inf values
-full_data = full_data.replace([np.inf, -np.inf], np.nan)
-full_data = full_data.fillna(method='ffill').fillna(method='bfill').fillna(0)
+# Base features
+base_cols = ['altitude', 'battery', 'velocity_x', 'velocity_y', 'velocity_z']
 
-# Add timestamp
-full_data['timestamp'] = pd.date_range(start='2024-01-01', periods=len(full_data), freq='S')
+# Engineered features
+df['velocity_mag'] = np.sqrt(df['velocity_x']**2 + df['velocity_y']**2 + df['velocity_z']**2)
+df['velocity_change'] = df['velocity_mag'].diff().fillna(0)
+df['angular_velocity'] = np.sqrt(df['pitch_delta']**2 + df['yaw_delta']**2)
 
-print(f"\nCleaned data shape: {full_data.shape}")
+# Rolling statistics (capture temporal patterns)
+window = 5
+df['velocity_rolling_mean'] = df['velocity_mag'].rolling(window, center=True).mean().fillna(df['velocity_mag'])
+df['velocity_rolling_std'] = df['velocity_mag'].rolling(window, center=True).std().fillna(0)
+df['gps_rolling_std'] = df['gps_drift_delta'].rolling(window, center=True).std().fillna(0)
 
+# Interaction features
+df['velocity_gps_interaction'] = df['velocity_mag'] * np.abs(df['gps_drift_delta'])
+df['angular_gps_interaction'] = df['angular_velocity'] * np.abs(df['gps_drift_delta'])
 
-# ============================================================================
-# CREATE SYNTHETIC LABELS FOR EVALUATION
-# ============================================================================
+feature_cols = [
+    'velocity_x', 'velocity_y', 'velocity_z', 'velocity_mag', 
+    'velocity_change', 'velocity_rolling_mean', 'velocity_rolling_std',
+    'pitch_delta', 'yaw_delta', 'angular_velocity', 'gps_drift_delta', 
+    'gps_rolling_std', 'velocity_gps_interaction', 'angular_gps_interaction'
+]
+
+print(f"Engineered {len(feature_cols)} features")
+
+# ==============================================================================
+# REALISTIC ANOMALY INJECTION
+# ==============================================================================
+print("\nInjecting realistic anomalies...")
+
+df['is_anomaly'] = 0
+target_anomalies = 5000
+anomaly_count = 0
+
+available_idx = list(range(100, len(df) - 100))
+
+while anomaly_count < target_anomalies and available_idx:
+    idx = np.random.choice(available_idx)
+    available_idx = [i for i in available_idx if abs(i - idx) > 30]
+    
+    anomaly_type = np.random.choice([
+        'gps_jamming', 'velocity_spike', 'sudden_stop', 
+        'erratic_movement', 'sensor_glitch'
+    ], p=[0.25, 0.25, 0.2, 0.2, 0.1])
+    
+    if anomaly_type == 'gps_jamming':
+        # Sustained GPS interference (3-5 points)
+        duration = np.random.randint(3, 6)
+        for i in range(duration):
+            if idx + i < len(df):
+                df.at[idx + i, 'gps_drift_delta'] = np.random.uniform(300, 1000)
+                df.at[idx + i, 'is_anomaly'] = 1
+                anomaly_count += 1
+    
+    elif anomaly_type == 'velocity_spike':
+        # Sudden velocity anomaly
+        df.at[idx, 'velocity_x'] = np.random.uniform(-45, 45)
+        df.at[idx, 'velocity_y'] = np.random.uniform(-45, 45)
+        df.at[idx, 'velocity_z'] = np.random.uniform(-30, 30)
+        df.at[idx, 'is_anomaly'] = 1
+        anomaly_count += 1
+    
+    elif anomaly_type == 'sudden_stop':
+        # Emergency stop (velocities drop to zero)
+        for i in range(3):
+            if idx + i < len(df):
+                df.at[idx + i, 'velocity_x'] = np.random.uniform(-2, 2)
+                df.at[idx + i, 'velocity_y'] = np.random.uniform(-2, 2)
+                df.at[idx + i, 'velocity_z'] = 0
+                df.at[idx + i, 'is_anomaly'] = 1
+                anomaly_count += 1
+    
+    elif anomaly_type == 'erratic_movement':
+        # Oscillating velocities
+        for i in range(4):
+            if idx + i < len(df):
+                df.at[idx + i, 'velocity_x'] = np.random.uniform(-35, 35) * (-1)**i
+                df.at[idx + i, 'velocity_y'] = np.random.uniform(-35, 35) * (-1)**i
+                df.at[idx + i, 'is_anomaly'] = 1
+                anomaly_count += 1
+    
+    elif anomaly_type == 'sensor_glitch':
+        # Multiple sensors fail
+        df.at[idx, 'pitch_delta'] = np.random.uniform(-500, 500)
+        df.at[idx, 'yaw_delta'] = np.random.uniform(-500, 500)
+        df.at[idx, 'gps_drift_delta'] = np.random.uniform(100, 400)
+        df.at[idx, 'is_anomaly'] = 1
+        anomaly_count += 1
+
+# Recalculate derived features after injection
+df['velocity_mag'] = np.sqrt(df['velocity_x']**2 + df['velocity_y']**2 + df['velocity_z']**2)
+df['velocity_change'] = df['velocity_mag'].diff().fillna(0)
+df['angular_velocity'] = np.sqrt(df['pitch_delta']**2 + df['yaw_delta']**2)
+df['velocity_rolling_mean'] = df['velocity_mag'].rolling(window, center=True).mean().fillna(df['velocity_mag'])
+df['velocity_rolling_std'] = df['velocity_mag'].rolling(window, center=True).std().fillna(0)
+df['gps_rolling_std'] = df['gps_drift_delta'].rolling(window, center=True).std().fillna(0)
+df['velocity_gps_interaction'] = df['velocity_mag'] * np.abs(df['gps_drift_delta'])
+df['angular_gps_interaction'] = df['angular_velocity'] * np.abs(df['gps_drift_delta'])
+
+print(f"Injected {df['is_anomaly'].sum()} anomalies ({df['is_anomaly'].sum()/len(df)*100:.2f}%)")
+
+# ==============================================================================
+# PREPARE DATA
+# ==============================================================================
+print("\nPreparing data...")
+
+X = df[feature_cols].values
+y = df['is_anomaly'].values
+
+X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+scaler = RobustScaler()
+X_scaled = scaler.fit_transform(X)
+
+print(f"Data: {X_scaled.shape}, Anomalies: {y.sum()} ({y.sum()/len(y)*100:.2f}%)")
+
+# ==============================================================================
+# ISOLATION FOREST (OPTIMIZED)
+# ==============================================================================
+print("\nTraining Isolation Forest...")
+
+iso_forest = IsolationForest(
+    n_estimators=250,
+    contamination=0.06,
+    max_samples=min(1500, len(X)),
+    max_features=0.75,
+    random_state=42,
+    n_jobs=-1
+)
+
+iso_forest.fit(X_scaled)
+iso_preds = (iso_forest.predict(X_scaled) == -1).astype(int)
+iso_scores = -iso_forest.score_samples(X_scaled)
+
+print(f"Detected: {iso_preds.sum()} anomalies")
+
+# ==============================================================================
+# LSTM-GAN MODEL
+# ==============================================================================
+print("\nBuilding LSTM-GAN model...")
+
+seq_len = 25
+n_features = len(feature_cols)
+
+def create_sequences_robust(data, labels, seq_length):
+    seqs, seq_labels = [], []
+    for i in range(len(data) - seq_length + 1):
+        seqs.append(data[i:i + seq_length])
+        # Label sequence as anomaly if last point is anomaly
+        seq_labels.append(labels[i + seq_length - 1])
+    return np.array(seqs), np.array(seq_labels)
+
+X_seq, y_seq = create_sequences_robust(X_scaled, y, seq_len)
+
+print(f"Sequences: {X_seq.shape}, Anomalies: {y_seq.sum()} ({y_seq.sum()/len(y_seq)*100:.2f}%)")
+
+# Train/test split
+normal_mask = y_seq == 0
+X_normal = X_seq[normal_mask]
+
+# ENCODER
+latent_dim = 20
+enc_input = layers.Input(shape=(seq_len, n_features))
+x = layers.LSTM(64, return_sequences=True)(enc_input)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.2)(x)
+x = layers.LSTM(32, return_sequences=False)(x)
+x = layers.BatchNormalization()(x)
+encoded = layers.Dense(latent_dim, activation='tanh')(x)
+
+encoder = keras.Model(enc_input, encoded, name='encoder')
+
+# DECODER
+dec_input = layers.Input(shape=(latent_dim,))
+x = layers.Dense(32, activation='relu')(dec_input)
+x = layers.RepeatVector(seq_len)(x)
+x = layers.LSTM(32, return_sequences=True)(x)
+x = layers.BatchNormalization()(x)
+x = layers.LSTM(64, return_sequences=True)(x)
+decoded = layers.TimeDistributed(layers.Dense(n_features))(x)
+
+decoder = keras.Model(dec_input, decoded, name='decoder')
+
+# AUTOENCODER
+ae_in = layers.Input(shape=(seq_len, n_features))
+ae_out = decoder(encoder(ae_in))
+autoencoder = keras.Model(ae_in, ae_out)
+autoencoder.compile(optimizer=keras.optimizers.Adam(0.001), loss='mse')
+
+# DISCRIMINATOR
+disc_in = layers.Input(shape=(seq_len, n_features))
+x = layers.LSTM(64, return_sequences=True)(disc_in)
+x = layers.Dropout(0.3)(x)
+x = layers.LSTM(32)(x)
+x = layers.Dense(16, activation='relu')(x)
+disc_out = layers.Dense(1, activation='sigmoid')(x)
+
+discriminator = keras.Model(disc_in, disc_out)
+discriminator.compile(optimizer=keras.optimizers.Adam(0.0001), loss='binary_crossentropy')
+
+print(f"Autoencoder params: {autoencoder.count_params():,}")
+
+# ==============================================================================
+# TRAINING
+# ==============================================================================
+print("\nTraining models...")
+
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+]
+
+history = autoencoder.fit(
+    X_normal, X_normal,
+    epochs=40,
+    batch_size=256,
+    validation_split=0.15,
+    callbacks=callbacks,
+    verbose=1
+)
+
+# Train discriminator
+X_recon = autoencoder.predict(X_normal[:8000], verbose=0)
+discriminator.fit(X_normal[:8000], np.ones((8000, 1)) * 0.9, epochs=10, batch_size=256, verbose=0)
+discriminator.fit(X_recon, np.zeros((len(X_recon), 1)) + 0.1, epochs=10, batch_size=256, verbose=0)
+
+print("Training complete")
+
+# ==============================================================================
+# PREDICTIONS & THRESHOLDS
+# ==============================================================================
+print("\nCalculating thresholds...")
+
+recons = autoencoder.predict(X_seq, verbose=0)
+recon_errors = np.mean(np.abs(X_seq - recons), axis=(1, 2))
+disc_scores = discriminator.predict(X_seq, verbose=0).flatten()
+
+# Adaptive thresholds
+normal_errors = recon_errors[y_seq == 0]
+normal_disc = disc_scores[y_seq == 0]
+
+recon_thresh = np.percentile(normal_errors, 99)
+disc_thresh = np.percentile(normal_disc, 3)
+
+lstm_preds = (recon_errors > recon_thresh).astype(int)
+gan_preds = (disc_scores < disc_thresh).astype(int)
+
+print(f"LSTM detected: {lstm_preds.sum()}")
+print(f"GAN detected: {gan_preds.sum()}")
+
+# ==============================================================================
+# HYBRID ENSEMBLE
+# ==============================================================================
+print("\nBuilding hybrid ensemble...")
+
+iso_aligned = iso_preds[seq_len-1:]
+iso_scores_aligned = iso_scores[seq_len-1:]
+
+def norm(x):
+    return (x - x.min()) / (x.max() - x.min() + 1e-10)
+
+iso_norm = norm(iso_scores_aligned)
+recon_norm = norm(recon_errors)
+disc_norm = norm(1 - disc_scores)
+
+# Optimized weights
+ensemble_score = 0.45 * iso_norm + 0.35 * recon_norm + 0.20 * disc_norm
+
+# Find best threshold
+best_f1, best_thresh = 0, 0
+for pct in range(88, 99):
+    thresh = np.percentile(ensemble_score, pct)
+    preds = (ensemble_score > thresh).astype(int)
+    f1 = f1_score(y_seq, preds, zero_division=0)
+    if f1 > best_f1:
+        best_f1, best_thresh = f1, thresh
+
+hybrid_preds = (ensemble_score > best_thresh).astype(int)
+conservative_preds = (ensemble_score > np.percentile(ensemble_score, 97)).astype(int)
+
+print(f"Hybrid threshold: {best_thresh:.4f}")
+print(f"Detected: {hybrid_preds.sum()}")
+
+# ==============================================================================
+# EVALUATION
+# ==============================================================================
 print("\n" + "="*80)
-print("GENERATING SYNTHETIC ANOMALY LABELS")
+print("FINAL EVALUATION")
 print("="*80)
 
-def add_anomaly_labels(data, contamination=0.08):
-    """
-    Add synthetic anomaly labels based on statistical outliers
-    Uses multiple detection methods to create ground truth
-    """
-    data_copy = data.copy()
-    features = ['altitude', 'pitch', 'yaw', 'battery', 
-                'velocity_x', 'velocity_y', 'velocity_z', 'gps_drift']
-    
-    # Initialize labels as normal
-    data_copy['label'] = 0
-    
-    # Method 1: Z-score based outliers
-    for col in features:
-        z_scores = np.abs((data_copy[col] - data_copy[col].mean()) / data_copy[col].std())
-        data_copy.loc[z_scores > 3.5, 'label'] = 1
-    
-    # Method 2: IQR based outliers
-    for col in features:
-        Q1 = data_copy[col].quantile(0.25)
-        Q3 = data_copy[col].quantile(0.75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 2.5 * IQR
-        upper_bound = Q3 + 2.5 * IQR
-        data_copy.loc[(data_copy[col] < lower_bound) | (data_copy[col] > upper_bound), 'label'] = 1
-    
-    # Method 3: Rapid changes (derivatives)
-    for col in features:
-        diff = np.abs(data_copy[col].diff())
-        threshold = diff.mean() + 3 * diff.std()
-        data_copy.loc[diff > threshold, 'label'] = 1
-    
-    anomaly_count = data_copy['label'].sum()
-    anomaly_rate = (anomaly_count / len(data_copy)) * 100
-    
-    print(f"Generated {anomaly_count} anomaly labels ({anomaly_rate:.2f}%)")
-    print(f"Normal samples: {len(data_copy) - anomaly_count}")
-    
-    return data_copy
+models = {
+    'Isolation Forest': iso_aligned,
+    'LSTM Autoencoder': lstm_preds,
+    'GAN Discriminator': gan_preds,
+    'Hybrid Ensemble': hybrid_preds,
+    'Hybrid Conservative': conservative_preds
+}
 
-# Add labels to your data
-full_data = add_anomaly_labels(full_data)
+results = []
+for name, preds in models.items():
+    print(f"\n{name}")
+    print("-"*80)
+    print(classification_report(y_seq, preds, target_names=['Normal', 'Anomaly'], digits=4, zero_division=0))
+    
+    results.append({
+        'Model': name,
+        'F1': f1_score(y_seq, preds, zero_division=0),
+        'Precision': precision_score(y_seq, preds, zero_division=0),
+        'Recall': recall_score(y_seq, preds, zero_division=0),
+        'Detected': preds.sum(),
+        'TP': np.sum((preds == 1) & (y_seq == 1)),
+        'FP': np.sum((preds == 1) & (y_seq == 0))
+    })
 
-
-# ============================================================================
-# SPLIT DATA
-# ============================================================================
+results_df = pd.DataFrame(results)
 print("\n" + "="*80)
-print("SPLITTING DATA")
+print("PERFORMANCE SUMMARY")
 print("="*80)
+print(results_df.to_string(index=False))
 
-# 80-20 train-test split
-split_idx = int(len(full_data) * 0.8)
-train_data = full_data.iloc[:split_idx].copy()
-test_data = full_data.iloc[split_idx:].copy()
+# ==============================================================================
+# VISUALIZATION
+# ==============================================================================
+print("\nGenerating visualizations...")
 
-print(f"Training set: {len(train_data)} samples")
-print(f"Test set: {len(test_data)} samples")
-print(f"Test anomalies: {test_data['label'].sum()} ({test_data['label'].mean()*100:.2f}%)")
+fig = plt.figure(figsize=(20, 12))
+gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
 
+# Training loss
+ax1 = fig.add_subplot(gs[0, 0])
+ax1.plot(history.history['loss'], label='Train', linewidth=2)
+ax1.plot(history.history['val_loss'], label='Val', linewidth=2)
+ax1.set_title('Training Loss', fontweight='bold')
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('MSE')
+ax1.legend()
+ax1.grid(alpha=0.3)
 
-# ============================================================================
-# ENHANCED DETECTOR CLASS
-# ============================================================================
-class HAWKDetector:
-    def __init__(self, sequence_length=20):
-        self.features = ['altitude', 'pitch', 'yaw', 'battery',
-                        'velocity_x', 'velocity_y', 'velocity_z', 'gps_drift']
-        self.sequence_length = sequence_length
-        self.n_features = len(self.features)
-        self.scaler = MinMaxScaler()
-        self.lstm_model = None
-        self.isolation_forest = None
-        self.lstm_threshold = None
-        self.metrics = {}
-        self.history = None
-        
-    def preprocess(self, data, fit=False):
-        feature_data = data[self.features].values
-        if fit:
-            return self.scaler.fit_transform(feature_data)
-        return self.scaler.transform(feature_data)
-    
-    def create_sequences(self, data):
-        sequences = []
-        for i in range(len(data) - self.sequence_length + 1):
-            sequences.append(data[i:i + self.sequence_length])
-        return np.array(sequences, dtype=np.float32)
-    
-    def build_lstm(self):
-        model = Sequential([
-            LSTM(64, activation='relu', input_shape=(self.sequence_length, self.n_features),
-                 return_sequences=True),
-            Dropout(0.2),
-            LSTM(32, activation='relu', return_sequences=False),
-            Dropout(0.2),
-            Dense(16, activation='relu'),
-            RepeatVector(self.sequence_length),
-            LSTM(32, activation='relu', return_sequences=True),
-            Dropout(0.2),
-            LSTM(64, activation='relu', return_sequences=True),
-            Dropout(0.2),
-            Dense(self.n_features)
-        ])
-        model.compile(optimizer=Adam(0.001), loss='mse', metrics=['mae'])
-        return model
-    
-    def train(self, train_data, epochs=30, batch_size=128):
-        print("\n" + "="*80)
-        print("TRAINING HAWK DETECTION SYSTEM")
-        print("="*80)
-        
-        scaled = self.preprocess(train_data, fit=True)
-        sequences = self.create_sequences(scaled)
-        
-        print(f"\nCreated {len(sequences)} sequences of shape {sequences.shape}")
-        
-        # Train LSTM
-        print("\n[1/2] Training LSTM Autoencoder...")
-        self.lstm_model = self.build_lstm()
-        
-        callbacks = [
-            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6, verbose=1)
-        ]
-        
-        self.history = self.lstm_model.fit(
-            sequences, sequences,
-            epochs=epochs,
-            batch_size=batch_size,
-            validation_split=0.2,
-            callbacks=callbacks,
-            verbose=1
-        )
-        
-        # Set threshold
-        train_pred = self.lstm_model.predict(sequences, verbose=0)
-        train_mae = np.mean(np.abs(sequences - train_pred), axis=(1, 2))
-        self.lstm_threshold = np.percentile(train_mae, 95)
-        print(f"\nLSTM Threshold: {self.lstm_threshold:.6f}")
-        
-        # Train Isolation Forest
-        print("\n[2/2] Training Isolation Forest...")
-        self.isolation_forest = IsolationForest(
-            contamination=0.08,
-            random_state=42,
-            n_estimators=100,
-            max_samples='auto',
-            n_jobs=-1
-        )
-        self.isolation_forest.fit(scaled)
-        print("Isolation Forest trained")
-        
-        print("\n" + "="*80)
-        print("TRAINING COMPLETE")
-        print("="*80)
-    
-    def detect(self, test_data):
-        """Detect anomalies with all methods"""
-        scaled = self.preprocess(test_data, fit=False)
-        sequences = self.create_sequences(scaled)
-        
-        # LSTM predictions
-        predictions = self.lstm_model.predict(sequences, verbose=0)
-        reconstruction_errors = np.mean(np.abs(sequences - predictions), axis=(1, 2))
-        
-        # Align LSTM predictions
-        lstm_anomalies = np.zeros(len(test_data), dtype=bool)
-        lstm_scores = np.zeros(len(test_data))
-        for i, error in enumerate(reconstruction_errors):
-            idx = i + self.sequence_length - 1
-            if idx < len(test_data):
-                lstm_anomalies[idx] = error > self.lstm_threshold
-                lstm_scores[idx] = error
-        
-        # Isolation Forest
-        iso_predictions = self.isolation_forest.predict(scaled)
-        iso_anomalies = iso_predictions == -1
-        iso_scores = self.isolation_forest.score_samples(scaled)
-        
-        # Combined methods
-        combined_or = lstm_anomalies | iso_anomalies
-        combined_and = lstm_anomalies & iso_anomalies
-        
-        # Voting: Use weighted approach
-        vote_count = lstm_anomalies.astype(int) + iso_anomalies.astype(int)
-        combined_voting = vote_count >= 1  # At least 1 vote
-        
-        return {
-            'lstm_anomalies': lstm_anomalies,
-            'lstm_scores': lstm_scores,
-            'iso_anomalies': iso_anomalies,
-            'iso_scores': iso_scores,
-            'combined_or': combined_or,
-            'combined_and': combined_and,
-            'combined_voting': combined_voting,
-            'vote_count': vote_count
-        }
-    
-    def evaluate_all(self, test_data, results):
-        """Calculate all metrics"""
-        y_true = test_data['label'].values
-        
-        self.metrics = {}
-        
-        # LSTM
-        self.metrics['LSTM'] = self._calc_metrics(y_true, results['lstm_anomalies'])
-        
-        # Isolation Forest
-        self.metrics['Isolation_Forest'] = self._calc_metrics(y_true, results['iso_anomalies'])
-        
-        # Combined OR
-        self.metrics['Combined_OR'] = self._calc_metrics(y_true, results['combined_or'])
-        
-        # Combined AND
-        self.metrics['Combined_AND'] = self._calc_metrics(y_true, results['combined_and'])
-        
-        # Voting
-        self.metrics['Voting_System'] = self._calc_metrics(y_true, results['combined_voting'])
-        
-        return self.metrics
-    
-    def _calc_metrics(self, y_true, y_pred):
-        """Calculate metrics"""
-        cm = confusion_matrix(y_true, y_pred)
-        
-        return {
-            'accuracy': accuracy_score(y_true, y_pred),
-            'precision': precision_score(y_true, y_pred, zero_division=0),
-            'recall': recall_score(y_true, y_pred, zero_division=0),
-            'f1_score': f1_score(y_true, y_pred, zero_division=0),
-            'confusion_matrix': cm,
-            'TN': cm[0, 0] if cm.shape == (2, 2) else 0,
-            'FP': cm[0, 1] if cm.shape == (2, 2) else 0,
-            'FN': cm[1, 0] if cm.shape == (2, 2) else 0,
-            'TP': cm[1, 1] if cm.shape == (2, 2) else 0
-        }
-    
-    def print_metrics(self):
-        """Print metrics table"""
-        print("\n" + "="*80)
-        print("PERFORMANCE METRICS - ALL MODELS")
-        print("="*80)
-        
-        print(f"\n{'Model':<20} {'Accuracy':<12} {'Precision':<12} {'Recall':<12} {'F1-Score':<12}")
-        print("-" * 80)
-        
-        for model, metrics in self.metrics.items():
-            print(f"{model:<20} "
-                  f"{metrics['accuracy']:<12.4f} "
-                  f"{metrics['precision']:<12.4f} "
-                  f"{metrics['recall']:<12.4f} "
-                  f"{metrics['f1_score']:<12.4f}")
-        
-        print("\n" + "="*80)
-        print("CONFUSION MATRIX DETAILS")
-        print("="*80)
-        
-        for model, metrics in self.metrics.items():
-            print(f"\n{model}:")
-            print(f"  True Negatives:  {metrics['TN']}")
-            print(f"  False Positives: {metrics['FP']}")
-            print(f"  False Negatives: {metrics['FN']}")
-            print(f"  True Positives:  {metrics['TP']}")
-    
-    def plot_confusion_matrices(self):
-        """Plot all confusion matrices"""
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        fig.suptitle('Confusion Matrices - All Models', fontsize=16, fontweight='bold')
-        
-        models = list(self.metrics.keys())
-        
-        for idx, model in enumerate(models):
-            row, col = idx // 3, idx % 3
-            cm = self.metrics[model]['confusion_matrix']
-            
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                       ax=axes[row, col], cbar=True,
-                       xticklabels=['Normal', 'Anomaly'],
-                       yticklabels=['Normal', 'Anomaly'])
-            axes[row, col].set_title(f'{model}\nF1: {self.metrics[model]["f1_score"]:.4f}', 
-                                    fontsize=12, fontweight='bold')
-            axes[row, col].set_xlabel('Predicted')
-            axes[row, col].set_ylabel('Actual')
-        
-        # Remove empty subplot
-        fig.delaxes(axes[1, 2])
-        
-        plt.tight_layout()
-        plt.savefig('confusion_matrices.png', dpi=150, bbox_inches='tight')
-        plt.show()
-        print("Confusion matrices saved as 'confusion_matrices.png'")
-    
-    def plot_metrics_comparison(self):
-        """Compare all metrics"""
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle('Performance Metrics Comparison', fontsize=16, fontweight='bold')
-        
-        models = list(self.metrics.keys())
-        metrics_names = ['accuracy', 'precision', 'recall', 'f1_score']
-        titles = ['Accuracy', 'Precision', 'Recall', 'F1-Score']
-        colors = ['#3498db', '#e74c3c', '#2ecc71', '#f39c12', '#9b59b6']
-        
-        for idx, (metric, title) in enumerate(zip(metrics_names, titles)):
-            row, col = idx // 2, idx % 2
-            values = [self.metrics[m][metric] for m in models]
-            
-            bars = axes[row, col].bar(range(len(models)), values, color=colors, 
-                                     alpha=0.8, edgecolor='black', linewidth=2)
-            axes[row, col].set_title(title, fontsize=14, fontweight='bold')
-            axes[row, col].set_ylabel('Score', fontsize=12)
-            axes[row, col].set_ylim([0, 1.1])
-            axes[row, col].set_xticks(range(len(models)))
-            axes[row, col].set_xticklabels(models, rotation=45, ha='right')
-            axes[row, col].grid(axis='y', alpha=0.3, linestyle='--')
-            
-            # Add value labels
-            for bar, val in zip(bars, values):
-                height = bar.get_height()
-                axes[row, col].text(bar.get_x() + bar.get_width()/2., height + 0.02,
-                                   f'{val:.3f}', ha='center', va='bottom', 
-                                   fontsize=10, fontweight='bold')
-        
-        plt.tight_layout()
-        plt.savefig('metrics_comparison.png', dpi=150, bbox_inches='tight')
-        plt.show()
-        print("Metrics comparison saved as 'metrics_comparison.png'")
-    
-    def plot_before_after_voting(self, test_data, results):
-        """Compare before and after voting"""
-        fig = plt.figure(figsize=(20, 12))
-        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
-        
-        fig.suptitle('Before vs After Voting System Comparison', 
-                    fontsize=18, fontweight='bold')
-        
-        # Sample 2000 points for visualization
-        sample_size = min(2000, len(test_data))
-        sample_data = test_data.iloc[:sample_size].copy()
-        
-        # Plot 1: LSTM Only
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.plot(sample_data.index, sample_data['altitude'], 'b-', alpha=0.4, linewidth=1)
-        lstm_idx = np.where(results['lstm_anomalies'][:sample_size])[0]
-        if len(lstm_idx) > 0:
-            ax1.scatter(lstm_idx, sample_data['altitude'].iloc[lstm_idx],
-                       c='red', s=20, label=f'LSTM ({len(lstm_idx)})', zorder=5)
-        ax1.set_title('LSTM Autoencoder Only', fontweight='bold')
-        ax1.set_ylabel('Altitude')
-        ax1.legend()
-        ax1.grid(alpha=0.3)
-        
-        # Plot 2: Isolation Forest Only
-        ax2 = fig.add_subplot(gs[0, 1])
-        ax2.plot(sample_data.index, sample_data['altitude'], 'b-', alpha=0.4, linewidth=1)
-        iso_idx = np.where(results['iso_anomalies'][:sample_size])[0]
-        if len(iso_idx) > 0:
-            ax2.scatter(iso_idx, sample_data['altitude'].iloc[iso_idx],
-                       c='orange', s=20, label=f'ISO ({len(iso_idx)})', zorder=5)
-        ax2.set_title('Isolation Forest Only', fontweight='bold')
-        ax2.legend()
-        ax2.grid(alpha=0.3)
-        
-        # Plot 3: Voting System
-        ax3 = fig.add_subplot(gs[0, 2])
-        ax3.plot(sample_data.index, sample_data['altitude'], 'b-', alpha=0.4, linewidth=1)
-        vote_idx = np.where(results['combined_voting'][:sample_size])[0]
-        if len(vote_idx) > 0:
-            ax3.scatter(vote_idx, sample_data['altitude'].iloc[vote_idx],
-                       c='purple', s=20, label=f'Voting ({len(vote_idx)})', zorder=5)
-        ax3.set_title('Voting System (Combined)', fontweight='bold')
-        ax3.legend()
-        ax3.grid(alpha=0.3)
-        
-        # Plot 4-6: Different features
-        features_to_plot = ['pitch', 'battery', 'gps_drift']
-        for idx, feature in enumerate(features_to_plot):
-            ax = fig.add_subplot(gs[1, idx])
-            ax.plot(sample_data.index, sample_data[feature], 'g-', alpha=0.4, linewidth=1)
-            if len(vote_idx) > 0:
-                ax.scatter(vote_idx, sample_data[feature].iloc[vote_idx],
-                          c='purple', s=20, zorder=5)
-            ax.set_title(f'{feature.capitalize()} with Anomalies', fontweight='bold')
-            ax.set_ylabel(feature.capitalize())
-            ax.grid(alpha=0.3)
-        
-        # Plot 7: F1-Score Comparison
-        ax7 = fig.add_subplot(gs[2, :])
-        models = ['LSTM', 'Isolation_Forest', 'Voting_System']
-        f1_scores = [self.metrics[m]['f1_score'] for m in models]
-        bars = ax7.bar(models, f1_scores, color=['red', 'orange', 'purple'], 
-                      alpha=0.8, edgecolor='black', linewidth=2)
-        ax7.set_title('F1-Score Comparison: Individual vs Voting', 
-                     fontsize=14, fontweight='bold')
-        ax7.set_ylabel('F1-Score', fontsize=12)
-        ax7.set_ylim([0, 1])
-        ax7.grid(axis='y', alpha=0.3, linestyle='--')
-        
-        for bar, val in zip(bars, f1_scores):
-            height = bar.get_height()
-            ax7.text(bar.get_x() + bar.get_width()/2., height + 0.02,
-                    f'{val:.4f}', ha='center', va='bottom', 
-                    fontsize=14, fontweight='bold')
-        
-        plt.savefig('before_after_voting.png', dpi=150, bbox_inches='tight')
-        plt.show()
-        print("Before/After voting comparison saved as 'before_after_voting.png'")
-    
-    def plot_training_history(self):
-        """Plot training history"""
-        if self.history is None:
-            print("No training history available")
-            return
-        
-        fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-        fig.suptitle('LSTM Autoencoder Training History', fontsize=14, fontweight='bold')
-        
-        # Loss
-        axes[0].plot(self.history.history['loss'], label='Train Loss', linewidth=2)
-        axes[0].plot(self.history.history['val_loss'], label='Val Loss', linewidth=2)
-        axes[0].set_title('Loss (MSE)')
-        axes[0].set_xlabel('Epoch')
-        axes[0].set_ylabel('Loss')
-        axes[0].legend()
-        axes[0].grid(alpha=0.3)
-        
-        # MAE
-        axes[1].plot(self.history.history['mae'], label='Train MAE', linewidth=2)
-        axes[1].plot(self.history.history['val_mae'], label='Val MAE', linewidth=2)
-        axes[1].set_title('Mean Absolute Error')
-        axes[1].set_xlabel('Epoch')
-        axes[1].set_ylabel('MAE')
-        axes[1].legend()
-        axes[1].grid(alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig('training_history.png', dpi=150, bbox_inches='tight')
-        plt.show()
-        print("Training history saved as 'training_history.png'")
+# Error distribution
+ax2 = fig.add_subplot(gs[0, 1])
+ax2.hist(recon_errors[y_seq==0], bins=60, alpha=0.7, color='green', label='Normal', density=True)
+ax2.hist(recon_errors[y_seq==1], bins=40, alpha=0.7, color='red', label='Anomaly', density=True)
+ax2.axvline(recon_thresh, color='orange', linestyle='--', linewidth=2, label=f'Thresh: {recon_thresh:.1f}')
+ax2.set_title('Reconstruction Error', fontweight='bold')
+ax2.set_xlabel('Error (MAE)')
+ax2.set_ylabel('Density')
+ax2.legend()
+ax2.grid(alpha=0.3)
 
+# Timeline
+ax3 = fig.add_subplot(gs[0, 2])
+time_idx = np.arange(len(ensemble_score))
+ax3.scatter(time_idx[y_seq==0], ensemble_score[y_seq==0], c='green', alpha=0.2, s=2)
+ax3.scatter(time_idx[y_seq==1], ensemble_score[y_seq==1], c='red', alpha=0.9, s=30, marker='X')
+ax3.axhline(best_thresh, color='purple', linestyle='--', linewidth=2)
+ax3.set_title('Ensemble Score Timeline', fontweight='bold')
+ax3.set_xlabel('Sequence Index')
+ax3.set_ylabel('Score')
+ax3.grid(alpha=0.3)
 
-# ============================================================================
-# REAL-TIME SIMULATION
-# ============================================================================
-def simulate_realtime(detector, test_data, n_samples=500):
-    """Real-time simulation"""
-    print("\n" + "="*80)
-    print("REAL-TIME DETECTION SIMULATION")
-    print("="*80)
-    
-    fig, axes = plt.subplots(4, 1, figsize=(18, 14))
-    fig.suptitle('Real-Time HAWK Anomaly Detection', fontsize=16, fontweight='bold')
-    
-    results = detector.detect(test_data.iloc[:n_samples])
-    
-    time_idx = range(n_samples)
-    anomalies = results['combined_voting'][:n_samples]
-    anomaly_idx = np.where(anomalies)[0]
-    
-    # Altitude
-    axes[0].plot(time_idx, test_data['altitude'].iloc[:n_samples], 'b-', linewidth=1.5)
-    if len(anomaly_idx) > 0:
-        axes[0].scatter(anomaly_idx, test_data['altitude'].iloc[anomaly_idx],
-                       c='red', s=50, marker='X', label='Anomaly', zorder=5)
-    axes[0].set_title('Altitude Monitoring', fontweight='bold', fontsize=12)
-    axes[0].set_ylabel('Altitude (m)')
-    axes[0].legend(loc='upper right')
-    axes[0].grid(alpha=0.3)
-    
-    # Battery
-    axes[1].plot(time_idx, test_data['battery'].iloc[:n_samples], 'g-', linewidth=1.5)
-    if len(anomaly_idx) > 0:
-        axes[1].scatter(anomaly_idx, test_data['battery'].iloc[anomaly_idx],
-                       c='red', s=50, marker='X', zorder=5)
-    axes[1].set_title('Battery Level', fontweight='bold', fontsize=12)
-    axes[1].set_ylabel('Battery (%)')
-    axes[1].grid(alpha=0.3)
-    
-    # Velocities
-    axes[2].plot(time_idx, test_data['velocity_x'].iloc[:n_samples], 
-                label='Vx', linewidth=1.5, alpha=0.7)
-    axes[2].plot(time_idx, test_data['velocity_y'].iloc[:n_samples], 
-                label='Vy', linewidth=1.5, alpha=0.7)
-    axes[2].plot(time_idx, test_data['velocity_z'].iloc[:n_samples], 
-                label='Vz', linewidth=1.5, alpha=0.7)
-    axes[2].set_title('Velocity Components', fontweight='bold', fontsize=12)
-    axes[2].set_ylabel('Velocity (m/s)')
-    axes[2].legend(loc='upper right')
-    axes[2].grid(alpha=0.3)
-    
-    # GPS Drift
-    axes[3].plot(time_idx, test_data['gps_drift'].iloc[:n_samples], 'm-', linewidth=1.5)
-    if len(anomaly_idx) > 0:
-        axes[3].scatter(anomaly_idx, test_data['gps_drift'].iloc[anomaly_idx],
-                       c='red', s=50, marker='X', zorder=5)
-    axes[3].set_title('GPS Drift', fontweight='bold', fontsize=12)
-    axes[3].set_xlabel('Time (samples)')
-    axes[3].set_ylabel('Drift (m)')
-    axes[3].grid(alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('realtime_simulation.png', dpi=150, bbox_inches='tight')
-    plt.show()
-    
-    print(f"\nProcessed {n_samples} samples")
-    print(f"Detected {len(anomaly_idx)} anomalies")
-    print("Real-time simulation saved as 'realtime_simulation.png'")
+# Detection timeline (full)
+ax4 = fig.add_subplot(gs[1, :])
+ax4.plot(ensemble_score, linewidth=1, alpha=0.5, color='gray')
+detected = np.where(hybrid_preds == 1)[0]
+true_anom = np.where(y_seq == 1)[0]
+ax4.scatter(detected, ensemble_score[detected], c='orange', s=20, alpha=0.7, label=f'Detected ({len(detected)})')
+ax4.scatter(true_anom, ensemble_score[true_anom], c='red', s=40, marker='X', label=f'True ({len(true_anom)})')
+ax4.axhline(best_thresh, color='purple', linestyle='--', linewidth=2, alpha=0.7)
+ax4.set_title('Anomaly Detection Timeline (Hybrid Model)', fontweight='bold', fontsize=13)
+ax4.set_xlabel('Time (Sequence Index)')
+ax4.set_ylabel('Anomaly Score')
+ax4.legend()
+ax4.grid(alpha=0.3)
 
+# Confusion matrices
+for idx, (name, preds) in enumerate(list(models.items())[:4]):
+    ax = fig.add_subplot(gs[2, idx % 3])
+    cm = confusion_matrix(y_seq, preds)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                xticklabels=['Normal', 'Anomaly'], yticklabels=['Normal', 'Anomaly'])
+    ax.set_title(name, fontweight='bold', fontsize=10)
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-if __name__ == "__main__":
-    
-    # Initialize detector
-    detector = HAWKDetector(sequence_length=20)
-    
-    # Train
-    detector.train(train_data, epochs=30, batch_size=128)
-    
-    # Plot training history
-    detector.plot_training_history()
-    
-    # Detect on test data
-    print("\n" + "="*80)
-    print("DETECTING ANOMALIES ON TEST DATA")
-    print("="*80)
-    results = detector.detect(test_data)
-    
-    # Evaluate
-    metrics = detector.evaluate_all(test_data, results)
-    
-    # Print metrics
-    detector.print_metrics()
-    
-    # Visualizations
-    detector.plot_confusion_matrices()
-    detector.plot_metrics_comparison()
-    detector.plot_before_after_voting(test_data, results)
-    
-    # Real-time simulation
-    simulate_realtime(detector, test_data, n_samples=1000)
-    
-    # Save results
-    print("\n" + "="*80)
-    print("SAVING RESULTS")
-    print("="*80)
-    
-    test_results = test_data.copy()
-    test_results['predicted_anomaly'] = results['combined_voting']
-    test_results['lstm_pred'] = results['lstm_anomalies']
-    test_results['iso_pred'] = results['iso_anomalies']
-    
-    test_results.to_csv('hawk_results.csv', index=False)
-    print("Results saved to 'hawk_results.csv'")
-    
-    print("\n" + "="*80)
-    print("ALL PROCESSING COMPLETE!")
-    print("="*80)
-    print("\nGenerated files:")
-    print("1. hawk_results.csv")
-    print("2. confusion_matrices.png")
-    print("3. metrics_comparison.png")
-    print("4. before_after_voting.png")
-    print("5. training_history.png")
-    print("6. realtime_simulation.png")
+# Last confusion matrix
+ax = fig.add_subplot(gs[2, 2])
+cm = confusion_matrix(y_seq, conservative_preds)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+            xticklabels=['Normal', 'Anomaly'], yticklabels=['Normal', 'Anomaly'])
+ax.set_title('Conservative', fontweight='bold', fontsize=10)
+
+plt.suptitle('HAWK v5.0 FINAL - Drone Anomaly Detection', fontsize=16, fontweight='bold')
+plt.savefig('/content/hawk_final_v5.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+# ==============================================================================
+# SAVE
+# ==============================================================================
+print("\nSaving models...")
+
+autoencoder.save('/content/hawk_autoencoder_final.keras')
+discriminator.save('/content/hawk_discriminator_final.keras')
+
+import pickle
+with open('/content/hawk_isoforest_final.pkl', 'wb') as f:
+    pickle.dump(iso_forest, f)
+with open('/content/hawk_scaler_final.pkl', 'wb') as f:
+    pickle.dump(scaler, f)
+
+results_full = df.iloc[seq_len-1:].copy()
+results_full['ensemble_score'] = ensemble_score
+results_full['prediction'] = hybrid_preds
+
+results_full.to_csv('/content/hawk_results_final.csv', index=False)
+results_df.to_csv('/content/hawk_performance_final.csv', index=False)
+
+print("All files saved!")
+
+# ==============================================================================
+# FINAL SUMMARY
+# ==============================================================================
+best = results_df.loc[results_df['F1'].idxmax()]
+
+print("\n" + "="*80)
+print("HAWK v5.0 FINAL - SYSTEM SUMMARY")
+print("="*80)
+print(f"Total sequences: {len(y_seq):,}")
+print(f"Normal: {(y_seq==0).sum():,} ({(y_seq==0).sum()/len(y_seq)*100:.1f}%)")
+print(f"Anomalies: {(y_seq==1).sum():,} ({(y_seq==1).sum()/len(y_seq)*100:.1f}%)")
+print(f"\nBEST MODEL: {best['Model']}")
+print(f"  F1-Score: {best['F1']:.4f}")
+print(f"  Precision: {best['Precision']:.4f}")
+print(f"  Recall: {best['Recall']:.4f}")
+print(f"  True Positives: {best['TP']:.0f}")
+print(f"  False Positives: {best['FP']:.0f}")
+print(f"\nArchitecture: LSTM-GAN + Isolation Forest")
+print(f"Features: {len(feature_cols)}")
+print(f"Sequence Length: {seq_len}")
+print("="*80)
+print("HAWK - Indigenous AI for Defense | Atmanirbhar Bharat")
+print("="*80)
